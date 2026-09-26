@@ -31,7 +31,8 @@
     smooth: 0.5,
     stiffness: 120,
     damping: 10,
-    grabAmount: 0.5
+    grabAmount: 0.15,
+    depthGain: 1.6
   };
 
   // pulls.get(id) -> {
@@ -48,6 +49,8 @@
 
   // smoothed uv points per hand slot (0/1), for exponential smoothing.
   var smoothedHand = [null, null];
+  // smoothed hand-size proxy per hand slot (0/1), for depth (z) estimation.
+  var smoothedSize = [null, null];
 
   function vlen(v) { return Math.sqrt(v[0] * v[0] + v[1] * v[1]); }
   function vsub(a, b) { return [a[0] - b[0], a[1] - b[1]]; }
@@ -60,7 +63,7 @@
     return Math.sqrt(dx * dx + dy * dy);
   }
 
-  function grab(id, uv) {
+  function grab(id, uv, size) {
     var existing = pulls.get(id);
     pulls.set(id, {
       anchor: [uv[0], uv[1]],
@@ -70,6 +73,12 @@
       strain: 0,
       grip: existing ? existing.grip : 0,
       gripVel: 0,
+      // hand-size proxy at grab time, used to derive depth (z) from apparent
+      // shrink/growth of the hand. Left null for the mouse fallback, which
+      // drives depth directly via the wheel handler instead.
+      size0: (typeof size === 'number') ? size : null,
+      depth: 0,
+      depthVel: 0,
       held: true
     });
   }
@@ -80,6 +89,17 @@
     e.current = [uv[0], uv[1]];
     e.pull = vsub(e.current, e.anchor);
     e.strain = vlen(e.pull);
+  }
+
+  // update depth (pull-away-from-camera) from the current smoothed hand size.
+  // size shrinking relative to size0 (grab time) means the hand moved away.
+  function updateDepth(id, size) {
+    var e = pulls.get(id);
+    if (!e || !e.held || e.size0 == null) return;
+    var raw = params.depthGain * Math.log(e.size0 / size);
+    raw = Math.max(-0.3, Math.min(2.0, raw));
+    // extra smoothing on top of the already-smoothed size, since size jitters.
+    e.depth = lerp(e.depth, raw, 0.4);
   }
 
   function release(id) {
@@ -106,6 +126,11 @@
     var ag = -params.stiffness * e.grip - params.damping * e.gripVel;
     e.gripVel += ag * dt;
     e.grip += e.gripVel * dt;
+
+    // spring depth (pull-away-from-camera) back to zero the same way.
+    var ad = -params.stiffness * e.depth - params.damping * e.depthVel;
+    e.depthVel += ad * dt;
+    e.depth += e.depthVel * dt;
   }
 
   function integrate(dt) {
@@ -117,7 +142,8 @@
         stepSpring(e, dt);
         var speed = vlen(e.vel);
         var gripSpeed = Math.abs(e.gripVel);
-        if (vlen(e.pull) < 0.002 && speed < 0.002 && Math.abs(e.grip) < 0.01 && gripSpeed < 0.02) {
+        if (vlen(e.pull) < 0.002 && speed < 0.002 && Math.abs(e.grip) < 0.01 && gripSpeed < 0.02 &&
+            Math.abs(e.depth) < 0.01 && Math.abs(e.depthVel) < 0.02) {
           pulls.delete(id);
         }
       }
@@ -158,6 +184,16 @@
     canvasEl.addEventListener('pointerup', end);
     canvasEl.addEventListener('pointercancel', end);
     canvasEl.addEventListener('pointerleave', end);
+
+    // wheel while held simulates pulling the pinch away from the camera:
+    // scroll up (negative deltaY) increases depth.
+    canvasEl.addEventListener('wheel', function (ev) {
+      if (!active) return;
+      ev.preventDefault();
+      var e = pulls.get(MOUSE_ID);
+      if (!e || !e.held) return;
+      e.depth = Math.max(0, Math.min(2.0, e.depth - ev.deltaY * 0.002));
+    }, { passive: false });
   }
 
   // --- webcam ---
@@ -244,9 +280,22 @@
         seenIds.push(id);
 
         var thumb = lm[4], index = lm[8], wrist = lm[0], midMcp = lm[9];
+        var indexMcp = lm[5], pinkyMcp = lm[17];
         var handSize = dist(wrist.x, wrist.y, midMcp.x, midMcp.y) || 0.0001;
         var tipDist = dist(thumb.x, thumb.y, index.x, index.y);
         var ratio = tipDist / handSize;
+
+        // hand-size proxy for depth: average of three inter-landmark
+        // distances that all shrink/grow together as the hand moves away
+        // from / toward the camera.
+        var size = (
+          dist(wrist.x, wrist.y, midMcp.x, midMcp.y) +
+          dist(wrist.x, wrist.y, indexMcp.x, indexMcp.y) +
+          dist(indexMcp.x, indexMcp.y, pinkyMcp.x, pinkyMcp.y)
+        ) / 3;
+        var smSize = smoothedSize[h];
+        smSize = (smSize == null) ? size : lerp(smSize, size, params.smooth);
+        smoothedSize[h] = smSize;
 
         // midpoint in UV, mirrored horizontally to match mirrored video.
         var midX = (thumb.x + index.x) / 2;
@@ -268,11 +317,12 @@
         var isHeld = entry && entry.held;
 
         if (!isHeld && ratio < params.grab) {
-          grab(id, sm);
+          grab(id, sm, smSize);
         } else if (isHeld && ratio > params.release) {
           release(id);
         } else if (isHeld) {
           move(id, sm);
+          updateDepth(id, smSize);
         }
       }
     }
@@ -284,9 +334,11 @@
     });
     if (result && result.landmarks && result.landmarks.length < 2) {
       smoothedHand[1] = null;
+      smoothedSize[1] = null;
     }
     if (!result || !result.landmarks || result.landmarks.length < 1) {
       smoothedHand[0] = null;
+      smoothedSize[0] = null;
     }
   }
 
@@ -315,8 +367,9 @@
         anchor: e.anchor.slice(),
         current: e.current.slice(),
         pull: e.pull.slice(),
-        strain: e.grip * params.grabAmount + vlen(e.pull),
+        strain: e.grip * params.grabAmount + Math.max(e.depth, 0) + 0.6 * vlen(e.pull),
         grip: e.grip,
+        depth: e.depth,
         held: e.held
       });
     });
@@ -425,6 +478,7 @@ void main() {
   float foldGradTotal = 0.0;
   vec2 chromaDirAcc = vec2(0.0);
   float chromaWeight = 0.0;
+  float chromaSAcc = 0.0;
   float spokeAcc = 0.0;
   float glowAcc = 0.0;
   vec3 bandAcc = vec3(0.0);
@@ -434,8 +488,12 @@ void main() {
     if (i >= uCount) break;
     vec2 anchor = uAnchor[i];
     vec2 pull = uPull[i];
-    float strain = uStrain[i];
-    if (strain < 0.0002) continue;
+    // uStrain now spans a much wider range and means "how far the film is
+    // pulled toward the viewer": ~0.15 is a bare pinch, ~0.6-0.8 is a full
+    // grab (the original strength-1.0 look), and ~1.2-2.0 is an extreme
+    // pull that tents the whole burst up toward the camera.
+    float s = uStrain[i];
+    if (s < 0.0002) continue;
 
     vec2 centerUV = anchor + pull;
     vec2 centerP = centerUV * vec2(aspect, 1.0);
@@ -443,7 +501,11 @@ void main() {
     float dP = length(relP);
     vec2 dirP = relP / max(dP, 0.0001);
 
-    float R = max(uRadius, 0.01);
+    // region radius grows with strain: a bare pinch stays tight (~0.4 * uRadius),
+    // a full grab (s ~ 0.7) sits at ~uRadius, and an extreme pull tents the
+    // region out to ~2x uRadius.
+    float Rfactor = 0.4 + 1.6 * smoothstep(0.0, 1.8, s);
+    float R = max(uRadius, 0.01) * Rfactor;
     float t = dP / R;
     // hard region mask: 1 inside the burst, exactly 0 by 1.4R. Everything geometric/
     // colored below is gated by this so the surrounding frame stays pixel-clean.
@@ -453,13 +515,18 @@ void main() {
     float radialMag = 5.437 * t * exp(-2.0 * t);
 
     // pleated angular folds, phase perturbed by low-freq noise (and slow drift).
+    // a fine secondary harmonic fades in at high strain for longer, thinner petals.
     float ang = atan(relP.y, relP.x);
     float noisePhase = vnoise(vec2(ang * 1.5 + uTime * 0.05, t * 3.0) * 2.0 + float(i) * 13.7) * 2.0 - 1.0;
-    float fold = sin(uCreases * ang + noisePhase * 1.2);
+    float fineFold = 0.35 * smoothstep(0.7, 2.0, s) * sin(uCreases * 2.0 * ang - noisePhase * 1.7);
+    float fold = sin(uCreases * ang + noisePhase * 1.2) + fineFold;
     float foldMod = 1.0 + 0.8 * fold;
 
     float mag = radialMag * foldMod;
-    float strainScale = clamp(strain / 0.5, 0.0, 1.6);
+    // strainScale is the master intensity dial, calibrated so a full grab
+    // (s = 0.7) reproduces the original strength-1.0 look, stays gentle for a
+    // bare pinch (s ~ 0.15) and keeps climbing for an extreme tented pull.
+    float strainScale = clamp(1.4286 * s, 0.0, 3.2);
     // cap the radial pull-in at ~0.6R so content near the edge of the burst barely moves.
     float amt = min(mag * strainScale * uStrength * 0.26, 0.6) * m;
 
@@ -471,29 +538,36 @@ void main() {
     float wob = cos(uCreases * 0.5 * ang + noisePhase * 2.0);
     vec2 wobOffUV = (tangentP * wob * amt * R * 0.42) / vec2(aspect, 1.0);
 
-    // directional term: grabbed content follows the hand, elongating the pattern.
+    // directional term: grabbed content follows the hand, elongating the pattern
+    // and reading as the film tenting up toward the viewer at high strain.
     float gauss = exp(-(dP * dP) / max(R * R, 0.0001));
     vec2 pullOffUV = -pull * uStrength * gauss * strainScale * m;
 
     warpOffset += offUV + wobOffUV + pullOffUV;
 
     dispMagTotal += amt;
-    foldGradTotal += abs(fold) * m * 0.3;
+    foldGradTotal += abs(fold) * m * 0.3 * strainScale;
     chromaDirAcc += dirP * amt;
     chromaWeight += amt;
+    chromaSAcc += s * amt;
 
+    // spoke count/length grow with strain: an extreme pull sprouts many long
+    // spokes reaching toward the frame edges (length also scales via R above),
+    // while a bare pinch shows only a faint handful.
     float seed = float(i) * 41.17;
-    float sp = spokeSet(relP, dP, R, seed, 140.0)
-             + 0.6 * spokeSet(relP, dP, R * 0.7, seed + 71.0, 97.0);
+    float spokeGrow = smoothstep(0.7, 2.0, s);
+    float sp = spokeSet(relP, dP, R, seed, 140.0 + 70.0 * spokeGrow)
+             + 0.6 * spokeSet(relP, dP, R * 0.7, seed + 71.0, 97.0 + 50.0 * spokeGrow);
     spokeAcc += sp * strainScale;
 
-    // small soft glow dot right at the pinch center (sigma ~0.06R).
-    glowAcc += exp(-dP * dP / (2.0 * pow(R * 0.06, 2.0))) * strain * m;
+    // small soft glow dot right at the pinch center; grows only slightly with strain.
+    float glowSigma = max(uRadius, 0.01) * 0.06 * mix(1.0, 1.35, smoothstep(0.7, 2.0, s));
+    glowAcc += exp(-dP * dP / (2.0 * pow(glowSigma, 2.0))) * clamp(strainScale, 0.0, 1.6) * m;
 
     // thin-film style saturated hue ring, phase-locked to the folds.
     float bandT = fract(t * 3.0 + noisePhase);
     vec3 band = 0.5 + 0.5 * cos(6.28318 * (bandT + vec3(0.0, 0.333, 0.667)));
-    float bandW = 0.25 * m * clamp(strain, 0.0, 1.0);
+    float bandW = 0.25 * m * clamp(strainScale, 0.0, 1.3);
     bandAcc += band * bandW;
     bandWeight += bandW;
   }
@@ -633,7 +707,8 @@ import('https://cdn.jsdelivr.net/npm/lil-gui@0.19/dist/lil-gui.esm.min.js')
     gui.add(params, 'radius', 0.05, 0.6, 0.005);
     gui.add(params, 'creases', 0, 40, 1);
     gui.add(params, 'rainbow', 0, 3, 0.01);
-    gui.add(window.PinchTracker.params, 'grabAmount', 0, 1.5, 0.01).name('grab');
+    gui.add(window.PinchTracker.params, 'grabAmount', 0, 0.6, 0.01).name('grab');
+    gui.add(window.PinchTracker.params, 'depthGain', 0, 4, 0.05).name('depth');
     const springFolder = gui.addFolder('springiness');
     springFolder.add(window.PinchTracker.params, 'stiffness', 20, 400, 1);
     springFolder.add(window.PinchTracker.params, 'damping', 1, 30, 0.5);

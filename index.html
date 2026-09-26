@@ -30,7 +30,8 @@
     release: 0.45,
     smooth: 0.5,
     stiffness: 120,
-    damping: 10
+    damping: 10,
+    grabAmount: 0.5
   };
 
   // pulls.get(id) -> {
@@ -67,6 +68,8 @@
       pull: [0, 0],
       vel: existing ? existing.vel.slice() : [0, 0],
       strain: 0,
+      grip: existing ? existing.grip : 0,
+      gripVel: 0,
       held: true
     });
   }
@@ -97,14 +100,24 @@
     e.pull[1] += e.vel[1] * dt;
     e.current = vadd(e.anchor, e.pull);
     e.strain = vlen(e.pull);
+
+    // spring grip back to zero with the same semi-implicit Euler dynamics,
+    // so it wobbles instead of just decaying.
+    var ag = -params.stiffness * e.grip - params.damping * e.gripVel;
+    e.gripVel += ag * dt;
+    e.grip += e.gripVel * dt;
   }
 
   function integrate(dt) {
     pulls.forEach(function (e, id) {
-      if (!e.held) {
+      if (e.held) {
+        // fast ramp to full grip (~0.25s), regardless of hand movement.
+        e.grip += (1 - e.grip) * Math.min(1, dt * 10);
+      } else {
         stepSpring(e, dt);
         var speed = vlen(e.vel);
-        if (vlen(e.pull) < 0.002 && speed < 0.002) {
+        var gripSpeed = Math.abs(e.gripVel);
+        if (vlen(e.pull) < 0.002 && speed < 0.002 && Math.abs(e.grip) < 0.01 && gripSpeed < 0.02) {
           pulls.delete(id);
         }
       }
@@ -302,7 +315,8 @@
         anchor: e.anchor.slice(),
         current: e.current.slice(),
         pull: e.pull.slice(),
-        strain: e.strain,
+        strain: e.grip * params.grabAmount + vlen(e.pull),
+        grip: e.grip,
         held: e.held
       });
     });
@@ -488,7 +502,7 @@ gl.bindVertexArray(vao);
 
 // ---------- texture (video or fallback) ----------
 const tex = gl.createTexture();
-gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
 gl.bindTexture(gl.TEXTURE_2D, tex);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
@@ -548,6 +562,7 @@ import('https://cdn.jsdelivr.net/npm/lil-gui@0.19/dist/lil-gui.esm.min.js')
     gui.add(params, 'radius', 0.05, 0.6, 0.005);
     gui.add(params, 'creases', 0, 40, 1);
     gui.add(params, 'rainbow', 0, 3, 0.01);
+    gui.add(window.PinchTracker.params, 'grabAmount', 0, 1.5, 0.01).name('grab');
     const springFolder = gui.addFolder('springiness');
     springFolder.add(window.PinchTracker.params, 'stiffness', 20, 400, 1);
     springFolder.add(window.PinchTracker.params, 'damping', 1, 30, 0.5);

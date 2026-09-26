@@ -579,11 +579,16 @@ void main() {
   videoUV = clamp(videoUV, 0.001, 0.999);
 
   vec2 dirN = vec2(1.0, 0.0);
+  float sAvg = 0.0;
   if (chromaWeight > 0.0001) {
     vec2 cd = chromaDirAcc / chromaWeight;
     if (length(cd) > 0.0001) dirN = normalize(cd);
+    sAvg = chromaSAcc / chromaWeight;
   }
-  float chromaMag = clamp((dispMagTotal + foldGradTotal) * uRainbow * 0.22, 0.0, 0.5);
+  // fringing widens and saturates further on top of the base look as the pull
+  // goes extreme (s well past the s=0.7 "full grab" calibration point).
+  float chromaWiden = mix(1.0, 2.0, smoothstep(0.6, 2.0, sAvg));
+  float chromaMag = clamp((dispMagTotal + foldGradTotal) * uRainbow * 0.22 * chromaWiden, 0.0, 0.9);
   vec2 chromaOffUV = (dirN * chromaMag * uRadius) / vec2(aspect, 1.0);
   vec2 chromaOffVideo = vec2(-chromaOffUV.x, chromaOffUV.y) * uCoverScale;
 
@@ -810,7 +815,7 @@ function frame(now) {
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
   const heldCount = pulls.filter(p => p.held).length;
-  statusEl.textContent = `${window.PinchTracker.status} | pinch thumb+index to grab, drag to pull | active:${heldCount}`;
+  statusEl.textContent = `${window.PinchTracker.status} | pinch to grab, pull your hand away from the screen (mouse: drag, scroll = depth) | active:${heldCount}`;
 }
 requestAnimationFrame(frame);
 </script>

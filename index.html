@@ -1,0 +1,657 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>pinching plastic</title>
+<style>
+  html, body { margin:0; padding:0; background:#000; overflow:hidden; width:100%; height:100%; }
+  canvas { display:block; position:fixed; inset:0; width:100vw; height:100vh; touch-action:none; }
+  #status {
+    position:fixed; left:10px; bottom:10px; z-index:10;
+    font:12px/1.4 monospace; color:#9f9; background:rgba(0,0,0,0.4);
+    padding:4px 8px; border-radius:4px; pointer-events:none;
+    max-width:60vw;
+  }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+<video id="video" autoplay muted playsinline style="display:none"></video>
+<div id="status">loading...</div>
+
+<script>
+// hand.js — webcam + hand-pinch tracking for the "pinching plastic" toy.
+// Plain script, no imports/exports. Exposes window.PinchTracker.
+(function () {
+  'use strict';
+
+  var params = {
+    grab: 0.28,
+    release: 0.45,
+    smooth: 0.5,
+    stiffness: 120,
+    damping: 10
+  };
+
+  // pulls.get(id) -> {
+  //   anchor:[x,y], current:[x,y], pull:[x,y], vel:[x,y], strain, held
+  // }
+  var pulls = new Map();
+
+  var status = 'idle';
+
+  var video = null;
+  var handLandmarker = null;
+  var lastVideoTime = -1;
+  var rafId = null;
+
+  // smoothed uv points per hand slot (0/1), for exponential smoothing.
+  var smoothedHand = [null, null];
+
+  function vlen(v) { return Math.sqrt(v[0] * v[0] + v[1] * v[1]); }
+  function vsub(a, b) { return [a[0] - b[0], a[1] - b[1]]; }
+  function vadd(a, b) { return [a[0] + b[0], a[1] + b[1]]; }
+
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  function dist(ax, ay, bx, by) {
+    var dx = ax - bx, dy = ay - by;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+
+  function grab(id, uv) {
+    var existing = pulls.get(id);
+    pulls.set(id, {
+      anchor: [uv[0], uv[1]],
+      current: [uv[0], uv[1]],
+      pull: [0, 0],
+      vel: existing ? existing.vel.slice() : [0, 0],
+      strain: 0,
+      held: true
+    });
+  }
+
+  function move(id, uv) {
+    var e = pulls.get(id);
+    if (!e || !e.held) return;
+    e.current = [uv[0], uv[1]];
+    e.pull = vsub(e.current, e.anchor);
+    e.strain = vlen(e.pull);
+  }
+
+  function release(id) {
+    var e = pulls.get(id);
+    if (!e) return;
+    e.held = false;
+    // pull/vel carry on into the spring; current stays anchor+pull.
+  }
+
+  // --- spring integration for released entries ---
+  function stepSpring(e, dt) {
+    // semi-implicit Euler on pull vector, spring to zero.
+    var ax = -params.stiffness * e.pull[0] - params.damping * e.vel[0];
+    var ay = -params.stiffness * e.pull[1] - params.damping * e.vel[1];
+    e.vel[0] += ax * dt;
+    e.vel[1] += ay * dt;
+    e.pull[0] += e.vel[0] * dt;
+    e.pull[1] += e.vel[1] * dt;
+    e.current = vadd(e.anchor, e.pull);
+    e.strain = vlen(e.pull);
+  }
+
+  function integrate(dt) {
+    pulls.forEach(function (e, id) {
+      if (!e.held) {
+        stepSpring(e, dt);
+        var speed = vlen(e.vel);
+        if (vlen(e.pull) < 0.002 && speed < 0.002) {
+          pulls.delete(id);
+        }
+      }
+    });
+  }
+
+  // --- mouse / pointer fallback ---
+  var MOUSE_ID = 'mouse';
+
+  function attachMouse(canvasEl) {
+    if (!canvasEl) return;
+    var active = false;
+
+    function uvFromEvent(ev) {
+      var rect = canvasEl.getBoundingClientRect();
+      var x = (ev.clientX - rect.left) / rect.width;
+      var y = (ev.clientY - rect.top) / rect.height;
+      return [x, y];
+    }
+
+    canvasEl.addEventListener('pointerdown', function (ev) {
+      active = true;
+      try { canvasEl.setPointerCapture(ev.pointerId); } catch (e) {}
+      grab(MOUSE_ID, uvFromEvent(ev));
+    });
+
+    canvasEl.addEventListener('pointermove', function (ev) {
+      if (!active) return;
+      move(MOUSE_ID, uvFromEvent(ev));
+    });
+
+    function end() {
+      if (!active) return;
+      active = false;
+      release(MOUSE_ID);
+    }
+
+    canvasEl.addEventListener('pointerup', end);
+    canvasEl.addEventListener('pointercancel', end);
+    canvasEl.addEventListener('pointerleave', end);
+  }
+
+  // --- webcam ---
+  function start(videoEl) {
+    video = videoEl;
+    status = 'loading camera';
+    return new Promise(function (resolve, reject) {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        status = 'no camera';
+        reject(new Error('getUserMedia unsupported'));
+        return;
+      }
+      navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: 'user',
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        }
+      }).then(function (stream) {
+        video.srcObject = stream;
+        video.playsInline = true;
+        video.muted = true;
+
+        function onReady() {
+          if (video.videoWidth > 0 && video.videoHeight > 0) {
+            video.removeEventListener('loadedmetadata', onReady);
+            resolve();
+            loadModel();
+            loop();
+          }
+        }
+        video.addEventListener('loadedmetadata', onReady);
+        video.play().then(function () {
+          onReady();
+        }).catch(function () {
+          // still may fire loadedmetadata later
+        });
+      }).catch(function (err) {
+        status = 'no camera';
+        reject(err);
+      });
+    });
+  }
+
+  function loadModel() {
+    status = 'loading model';
+    import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14')
+      .then(function (vision) {
+        var FilesetResolver = vision.FilesetResolver;
+        var HandLandmarker = vision.HandLandmarker;
+        return FilesetResolver.forVisionTasks(
+          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
+        ).then(function (filesetResolver) {
+          function create(delegate) {
+            return HandLandmarker.createFromOptions(filesetResolver, {
+              baseOptions: {
+                modelAssetPath:
+                  'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+                delegate: delegate
+              },
+              runningMode: 'VIDEO',
+              numHands: 2
+            });
+          }
+          return create('GPU').catch(function () {
+            return create('CPU');
+          });
+        });
+      }).then(function (landmarker) {
+        handLandmarker = landmarker;
+        status = 'ready';
+      }).catch(function (err) {
+        console.log('hand model failed to load, mouse fallback only', err);
+        status = 'no model';
+      });
+  }
+
+  function processResults(result) {
+    var seenIds = [];
+    if (result && result.landmarks) {
+      for (var h = 0; h < result.landmarks.length; h++) {
+        var lm = result.landmarks[h];
+        var id = 'hand' + h;
+        seenIds.push(id);
+
+        var thumb = lm[4], index = lm[8], wrist = lm[0], midMcp = lm[9];
+        var handSize = dist(wrist.x, wrist.y, midMcp.x, midMcp.y) || 0.0001;
+        var tipDist = dist(thumb.x, thumb.y, index.x, index.y);
+        var ratio = tipDist / handSize;
+
+        // midpoint in UV, mirrored horizontally to match mirrored video.
+        var midX = (thumb.x + index.x) / 2;
+        var midY = (thumb.y + index.y) / 2;
+        var uv = [1 - midX, midY];
+
+        var sm = smoothedHand[h];
+        if (!sm) {
+          sm = uv.slice();
+        } else {
+          sm = [
+            lerp(sm[0], uv[0], params.smooth),
+            lerp(sm[1], uv[1], params.smooth)
+          ];
+        }
+        smoothedHand[h] = sm;
+
+        var entry = pulls.get(id);
+        var isHeld = entry && entry.held;
+
+        if (!isHeld && ratio < params.grab) {
+          grab(id, sm);
+        } else if (isHeld && ratio > params.release) {
+          release(id);
+        } else if (isHeld) {
+          move(id, sm);
+        }
+      }
+    }
+    // release any hand entries no longer detected this frame.
+    pulls.forEach(function (e, id) {
+      if (id.indexOf('hand') === 0 && seenIds.indexOf(id) === -1 && e.held) {
+        release(id);
+      }
+    });
+    if (result && result.landmarks && result.landmarks.length < 2) {
+      smoothedHand[1] = null;
+    }
+    if (!result || !result.landmarks || result.landmarks.length < 1) {
+      smoothedHand[0] = null;
+    }
+  }
+
+  function loop() {
+    rafId = requestAnimationFrame(loop);
+    if (!handLandmarker || !video) return;
+    if (video.currentTime === lastVideoTime) return;
+    lastVideoTime = video.currentTime;
+    try {
+      var result = handLandmarker.detectForVideo(video, performance.now());
+      processResults(result);
+    } catch (err) {
+      console.log('detectForVideo failed', err);
+    }
+  }
+
+  function update(dt) {
+    integrate(dt);
+  }
+
+  function getPulls() {
+    var out = [];
+    pulls.forEach(function (e, id) {
+      out.push({
+        id: id,
+        anchor: e.anchor.slice(),
+        current: e.current.slice(),
+        pull: e.pull.slice(),
+        strain: e.strain,
+        held: e.held
+      });
+    });
+    return out;
+  }
+
+  window.PinchTracker = {
+    params: params,
+    start: start,
+    attachMouse: attachMouse,
+    update: update,
+    getPulls: getPulls,
+    get status() { return status; },
+    _process: processResults
+  };
+})();
+</script>
+
+<script type="module">
+const statusEl = document.getElementById('status');
+const canvas = document.getElementById('glcanvas');
+const video = document.getElementById('video');
+const gl = canvas.getContext('webgl2', { antialias: true, alpha: false });
+if (!gl) {
+  statusEl.textContent = 'WebGL2 not supported';
+  throw new Error('no webgl2');
+}
+
+// ---------- shaders ----------
+const VERT_SRC = `#version 300 es
+out vec2 vUV;
+void main() {
+  vec2 pos = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+  gl_Position = vec4(pos.x * 2.0 - 1.0, 1.0 - pos.y * 2.0, 0.0, 1.0);
+  vUV = pos;
+}`;
+
+const FRAG_SRC = `#version 300 es
+precision highp float;
+
+in vec2 vUV;
+out vec4 fragColor;
+
+uniform sampler2D uTex;
+uniform vec2 uRes;
+uniform float uTime;
+uniform int uCount;
+uniform vec2 uAnchor[4];
+uniform vec2 uPull[4];
+uniform float uStrain[4];
+uniform float uStrength;
+uniform float uRadius;
+uniform float uCreases;
+uniform float uRainbow;
+uniform vec2 uCoverScale;
+uniform vec2 uCoverOffset;
+
+float hash21(vec2 p) {
+  p = fract(p * vec2(123.34, 456.21));
+  p += dot(p, p + 45.32);
+  return fract(p.x * p.y);
+}
+
+float vnoise(vec2 p) {
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  float a = hash21(i);
+  float b = hash21(i + vec2(1.0, 0.0));
+  float c = hash21(i + vec2(0.0, 1.0));
+  float d = hash21(i + vec2(1.0, 1.0));
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+void main() {
+  vec2 uv = vUV;
+  float aspect = uRes.x / uRes.y;
+  vec2 p = uv * vec2(aspect, 1.0);
+
+  vec2 sampleUV = uv;
+  float s = 0.0;
+  vec2 aggDir = vec2(0.0);
+  float crease = 0.0;
+  float glossy = 0.0;
+
+  for (int i = 0; i < 4; i++) {
+    if (i >= uCount) break;
+    vec2 anchor = uAnchor[i];
+    vec2 pull = uPull[i];
+    float strain = uStrain[i];
+    if (strain < 0.0002) continue;
+
+    vec2 anchorP = anchor * vec2(aspect, 1.0);
+    vec2 currentP = (anchor + pull) * vec2(aspect, 1.0);
+    vec2 dir = pull / max(strain, 0.0001);
+
+    float radius = uRadius + strain * 0.9;
+    float d = distance(p, currentP);
+    float falloff = exp(-(d * d) / max(radius * radius, 0.0001));
+
+    sampleUV -= pull * uStrength * falloff;
+
+    float si = clamp(strain * falloff * 3.0, 0.0, 1.0);
+    s += si;
+
+    vec2 rel = p - anchorP;
+    float dRel = length(rel);
+    vec2 relDir = rel / max(dRel, 0.0001);
+    float cone = pow(max(dot(relDir, dir), 0.0), 1.5);
+    float ang = atan(rel.y, rel.x);
+    float n = vnoise(vec2(ang * 2.0, dRel * 8.0) * 3.0 + float(i) * 10.0);
+    float ridge = abs(sin(ang * uCreases + n * 1.8 + dRel * 1.5));
+    ridge = pow(1.0 - ridge, 8.0);
+    float creaseMask = si * cone;
+    crease += ridge * creaseMask;
+    glossy += pow(ridge, 4.0) * creaseMask;
+
+    vec2 normalDir = vec2(-relDir.y, relDir.x);
+    sampleUV += normalDir * (ridge - 0.5) * 0.01 * creaseMask;
+
+    aggDir += dir * strain;
+  }
+
+  s = clamp(s, 0.0, 1.0);
+  crease = clamp(crease, 0.0, 1.0);
+  glossy = clamp(glossy, 0.0, 1.0);
+
+  float lenAgg = length(aggDir);
+  vec2 dirN = lenAgg > 0.0001 ? aggDir / lenAgg : vec2(1.0, 0.0);
+
+  vec2 videoUV = sampleUV * uCoverScale + uCoverOffset;
+  videoUV.x = 1.0 - videoUV.x;
+  videoUV = clamp(videoUV, 0.001, 0.999);
+
+  vec2 chroma = dirN * s * uRainbow * 0.02;
+  float r = texture(uTex, clamp(videoUV + chroma, 0.0, 1.0)).r;
+  float g = texture(uTex, videoUV).g;
+  float b = texture(uTex, clamp(videoUV - chroma, 0.0, 1.0)).b;
+  vec3 color = vec3(r, g, b);
+
+  vec3 tint = 0.5 + 0.5 * cos(6.2831 * (s * 3.0 + vec3(0.0, 0.33, 0.67)));
+  color = mix(color, tint, s * uRainbow * 0.3);
+
+  color += crease * 0.16;
+  color -= (1.0 - crease) * s * 0.06;
+  color += glossy * 0.22;
+
+  fragColor = vec4(clamp(color, 0.0, 1.0), 1.0);
+}`;
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    console.error('shader compile error:', gl.getShaderInfoLog(sh));
+    throw new Error('shader compile failed');
+  }
+  return sh;
+}
+
+const vs = compile(gl.VERTEX_SHADER, VERT_SRC);
+const fs = compile(gl.FRAGMENT_SHADER, FRAG_SRC);
+const program = gl.createProgram();
+gl.attachShader(program, vs);
+gl.attachShader(program, fs);
+gl.linkProgram(program);
+if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+  console.error('program link error:', gl.getProgramInfoLog(program));
+  throw new Error('program link failed');
+}
+gl.useProgram(program);
+
+const U = {};
+['uTex','uRes','uTime','uCount','uStrength','uRadius','uCreases','uRainbow','uCoverScale','uCoverOffset']
+  .forEach(n => U[n] = gl.getUniformLocation(program, n));
+U.uAnchor = gl.getUniformLocation(program, 'uAnchor');
+U.uPull = gl.getUniformLocation(program, 'uPull');
+U.uStrain = gl.getUniformLocation(program, 'uStrain');
+
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+
+// ---------- texture (video or fallback) ----------
+const tex = gl.createTexture();
+gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+gl.bindTexture(gl.TEXTURE_2D, tex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+// placeholder 1x1 so texture is complete before first upload
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([20,20,30,255]));
+
+let useVideo = false;
+const fallback = document.createElement('canvas');
+fallback.width = 512; fallback.height = 512;
+const fctx = fallback.getContext('2d');
+
+function drawFallback(t) {
+  const w = fallback.width, h = fallback.height;
+  const grad = fctx.createLinearGradient(0, 0, w, h);
+  const hue = (t * 20) % 360;
+  grad.addColorStop(0, `hsl(${hue},70%,55%)`);
+  grad.addColorStop(0.5, `hsl(${(hue+90)%360},70%,45%)`);
+  grad.addColorStop(1, `hsl(${(hue+200)%360},70%,55%)`);
+  fctx.fillStyle = grad;
+  fctx.fillRect(0, 0, w, h);
+  fctx.strokeStyle = 'rgba(255,255,255,0.35)';
+  fctx.lineWidth = 2;
+  const step = 32;
+  for (let x = 0; x <= w; x += step) {
+    fctx.beginPath(); fctx.moveTo(x, 0); fctx.lineTo(x, h); fctx.stroke();
+  }
+  for (let y = 0; y <= h; y += step) {
+    fctx.beginPath(); fctx.moveTo(0, y); fctx.lineTo(w, y); fctx.stroke();
+  }
+  fctx.fillStyle = 'rgba(255,255,255,0.9)';
+  fctx.font = 'bold 42px monospace';
+  fctx.textAlign = 'center';
+  fctx.fillText('PINCH & PULL', w/2, h/2 - 20);
+  fctx.font = '20px monospace';
+  fctx.fillText('no camera - fallback texture', w/2, h/2 + 20);
+}
+
+// ---------- gui / params ----------
+const params = {
+  strength: 1,
+  radius: 0.18,
+  creases: 14,
+  rainbow: 1,
+};
+
+// GUI is loaded from CDN and must never block the render loop if it fails.
+import('https://cdn.jsdelivr.net/npm/lil-gui@0.19/dist/lil-gui.esm.min.js')
+  .then(({ default: GUI }) => {
+    const gui = new GUI({ title: 'plastic wrap' });
+    gui.domElement.style.position = 'fixed';
+    gui.domElement.style.top = '8px';
+    gui.domElement.style.right = '8px';
+    gui.domElement.style.zIndex = 20;
+    gui.add(params, 'strength', 0, 3, 0.01);
+    gui.add(params, 'radius', 0.05, 0.6, 0.005);
+    gui.add(params, 'creases', 0, 40, 1);
+    gui.add(params, 'rainbow', 0, 3, 0.01);
+    const springFolder = gui.addFolder('springiness');
+    springFolder.add(window.PinchTracker.params, 'stiffness', 20, 400, 1);
+    springFolder.add(window.PinchTracker.params, 'damping', 1, 30, 0.5);
+  })
+  .catch(err => console.warn('lil-gui failed to load, continuing without GUI:', err));
+
+// ---------- resize ----------
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.floor(window.innerWidth * dpr));
+  const h = Math.max(1, Math.floor(window.innerHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+    gl.viewport(0, 0, w, h);
+  }
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ---------- start tracker ----------
+window.PinchTracker.attachMouse(canvas);
+
+async function tryStartCamera() {
+  try {
+    await window.PinchTracker.start(video);
+    useVideo = true;
+  } catch (err) {
+    useVideo = false;
+    console.warn('PinchTracker.start failed, using fallback texture:', err && err.message);
+  }
+}
+tryStartCamera();
+
+// ---------- cover-fit ----------
+function computeCover(srcW, srcH) {
+  const canvasAspect = canvas.width / canvas.height;
+  const srcAspect = srcW / srcH;
+  let sx = 1, sy = 1;
+  if (canvasAspect > srcAspect) {
+    sy = srcAspect / canvasAspect;
+  } else {
+    sx = canvasAspect / srcAspect;
+  }
+  return [sx, sy, (1 - sx) * 0.5, (1 - sy) * 0.5];
+}
+
+// ---------- main loop ----------
+const anchorArr = new Float32Array(8);
+const pullArr = new Float32Array(8);
+const strainArr = new Float32Array(4);
+let last = performance.now();
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+
+  window.PinchTracker.update(dt);
+  const pulls = window.PinchTracker.getPulls().slice(0, 4);
+
+  anchorArr.fill(0); pullArr.fill(0); strainArr.fill(0);
+  pulls.forEach((p, i) => {
+    anchorArr[i*2] = p.anchor[0]; anchorArr[i*2+1] = p.anchor[1];
+    pullArr[i*2] = p.pull[0]; pullArr[i*2+1] = p.pull[1];
+    strainArr[i] = p.strain;
+  });
+
+  let cover;
+  if (useVideo && video.readyState >= 2 && video.videoWidth > 0) {
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+    cover = computeCover(video.videoWidth, video.videoHeight);
+  } else {
+    drawFallback(now / 1000);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, fallback);
+    cover = computeCover(fallback.width, fallback.height);
+  }
+
+  gl.useProgram(program);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.uniform1i(U.uTex, 0);
+  gl.uniform2f(U.uRes, canvas.width, canvas.height);
+  gl.uniform1f(U.uTime, now / 1000);
+  gl.uniform1i(U.uCount, pulls.length);
+  gl.uniform2fv(U.uAnchor, anchorArr);
+  gl.uniform2fv(U.uPull, pullArr);
+  gl.uniform1fv(U.uStrain, strainArr);
+  gl.uniform1f(U.uStrength, params.strength);
+  gl.uniform1f(U.uRadius, params.radius);
+  gl.uniform1f(U.uCreases, params.creases);
+  gl.uniform1f(U.uRainbow, params.rainbow);
+  gl.uniform2f(U.uCoverScale, cover[0], cover[1]);
+  gl.uniform2f(U.uCoverOffset, cover[2], cover[3]);
+
+  gl.bindVertexArray(vao);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  const heldCount = pulls.filter(p => p.held).length;
+  statusEl.textContent = `${window.PinchTracker.status} | pinch thumb+index to grab, drag to pull | active:${heldCount}`;
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

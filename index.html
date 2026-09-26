@@ -391,16 +391,44 @@ float vnoise(vec2 p) {
   return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 
+// thin radial spoke, hashed per angular cell for random presence/length/jitter.
+float spokeSet(vec2 rel, float d, float R, float seed, float nsp) {
+  float ang = atan(rel.y, rel.x);
+  float cell = (ang / 6.28318530718) * nsp;
+  float idx = floor(cell);
+  float f = fract(cell) - 0.5;
+  float jitter = (hash21(vec2(idx, seed + 1.0)) - 0.5) * 0.4;
+  float core = 1.0 - smoothstep(0.0, 0.028, abs(f - jitter));
+  float hLen = hash21(vec2(idx, seed + 5.0));
+  float onOff = step(0.5, hash21(vec2(idx, seed + 9.0)));
+  float len = R * mix(0.7, 3.2, hLen);
+  float along = smoothstep(len, len * 0.15, d) * exp(-d / (len * 0.55 + 0.001));
+  return core * onOff * along;
+}
+
+const vec3 SPEC0 = vec3(1.0, 0.0, 0.15);
+const vec3 SPEC1 = vec3(1.0, 0.45, 0.0);
+const vec3 SPEC2 = vec3(1.0, 0.95, 0.0);
+const vec3 SPEC3 = vec3(0.15, 1.0, 0.15);
+const vec3 SPEC4 = vec3(0.0, 1.0, 0.7);
+const vec3 SPEC5 = vec3(0.0, 0.6, 1.0);
+const vec3 SPEC6 = vec3(0.25, 0.0, 1.0);
+const vec3 SPEC7 = vec3(0.7, 0.0, 1.0);
+
 void main() {
   vec2 uv = vUV;
   float aspect = uRes.x / uRes.y;
   vec2 p = uv * vec2(aspect, 1.0);
 
-  vec2 sampleUV = uv;
-  float s = 0.0;
-  vec2 aggDir = vec2(0.0);
-  float crease = 0.0;
-  float glossy = 0.0;
+  vec2 warpOffset = vec2(0.0);
+  float dispMagTotal = 0.0;
+  float foldGradTotal = 0.0;
+  vec2 chromaDirAcc = vec2(0.0);
+  float chromaWeight = 0.0;
+  float spokeAcc = 0.0;
+  float glowAcc = 0.0;
+  vec3 bandAcc = vec3(0.0);
+  float bandWeight = 0.0;
 
   for (int i = 0; i < 4; i++) {
     if (i >= uCount) break;
@@ -409,60 +437,103 @@ void main() {
     float strain = uStrain[i];
     if (strain < 0.0002) continue;
 
-    vec2 anchorP = anchor * vec2(aspect, 1.0);
-    vec2 currentP = (anchor + pull) * vec2(aspect, 1.0);
-    vec2 dir = pull / max(strain, 0.0001);
+    vec2 centerUV = anchor + pull;
+    vec2 centerP = centerUV * vec2(aspect, 1.0);
+    vec2 relP = p - centerP;
+    float dP = length(relP);
+    vec2 dirP = relP / max(dP, 0.0001);
 
-    float radius = uRadius + strain * 0.9;
-    float d = distance(p, currentP);
-    float falloff = exp(-(d * d) / max(radius * radius, 0.0001));
+    float R = max(uRadius, 0.01);
+    float t = dP / R;
+    // hard region mask: 1 inside the burst, exactly 0 by 1.4R. Everything geometric/
+    // colored below is gated by this so the surrounding frame stays pixel-clean.
+    float m = 1.0 - smoothstep(0.9 * R, 1.4 * R, dP);
 
-    sampleUV -= pull * uStrength * falloff;
+    // radial suck-in profile: 0 at center, peaks near t=0.5, tapers off by ~1.2R.
+    float radialMag = 5.437 * t * exp(-2.0 * t);
 
-    float si = clamp(strain * falloff * 3.0, 0.0, 1.0);
-    s += si;
+    // pleated angular folds, phase perturbed by low-freq noise (and slow drift).
+    float ang = atan(relP.y, relP.x);
+    float noisePhase = vnoise(vec2(ang * 1.5 + uTime * 0.05, t * 3.0) * 2.0 + float(i) * 13.7) * 2.0 - 1.0;
+    float fold = sin(uCreases * ang + noisePhase * 1.2);
+    float foldMod = 1.0 + 0.8 * fold;
 
-    vec2 rel = p - anchorP;
-    float dRel = length(rel);
-    vec2 relDir = rel / max(dRel, 0.0001);
-    float cone = pow(max(dot(relDir, dir), 0.0), 1.5);
-    float ang = atan(rel.y, rel.x);
-    float n = vnoise(vec2(ang * 2.0, dRel * 8.0) * 3.0 + float(i) * 10.0);
-    float ridge = abs(sin(ang * uCreases + n * 1.8 + dRel * 1.5));
-    ridge = pow(1.0 - ridge, 8.0);
-    float creaseMask = si * cone;
-    crease += ridge * creaseMask;
-    glossy += pow(ridge, 4.0) * creaseMask;
+    float mag = radialMag * foldMod;
+    float strainScale = clamp(strain / 0.5, 0.0, 1.6);
+    // cap the radial pull-in at ~0.6R so content near the edge of the burst barely moves.
+    float amt = min(mag * strainScale * uStrength * 0.26, 0.6) * m;
 
-    vec2 normalDir = vec2(-relDir.y, relDir.x);
-    sampleUV += normalDir * (ridge - 0.5) * 0.01 * creaseMask;
+    vec2 offP = dirP * amt * R;
+    vec2 offUV = offP / vec2(aspect, 1.0);
 
-    aggDir += dir * strain;
+    // tangential swirl dominates over radial so the folds read as distinct petals.
+    vec2 tangentP = vec2(-dirP.y, dirP.x);
+    float wob = cos(uCreases * 0.5 * ang + noisePhase * 2.0);
+    vec2 wobOffUV = (tangentP * wob * amt * R * 0.42) / vec2(aspect, 1.0);
+
+    // directional term: grabbed content follows the hand, elongating the pattern.
+    float gauss = exp(-(dP * dP) / max(R * R, 0.0001));
+    vec2 pullOffUV = -pull * uStrength * gauss * strainScale * m;
+
+    warpOffset += offUV + wobOffUV + pullOffUV;
+
+    dispMagTotal += amt;
+    foldGradTotal += abs(fold) * m * 0.3;
+    chromaDirAcc += dirP * amt;
+    chromaWeight += amt;
+
+    float seed = float(i) * 41.17;
+    float sp = spokeSet(relP, dP, R, seed, 140.0)
+             + 0.6 * spokeSet(relP, dP, R * 0.7, seed + 71.0, 97.0);
+    spokeAcc += sp * strainScale;
+
+    // small soft glow dot right at the pinch center (sigma ~0.06R).
+    glowAcc += exp(-dP * dP / (2.0 * pow(R * 0.06, 2.0))) * strain * m;
+
+    // thin-film style saturated hue ring, phase-locked to the folds.
+    float bandT = fract(t * 3.0 + noisePhase);
+    vec3 band = 0.5 + 0.5 * cos(6.28318 * (bandT + vec3(0.0, 0.333, 0.667)));
+    float bandW = 0.25 * m * clamp(strain, 0.0, 1.0);
+    bandAcc += band * bandW;
+    bandWeight += bandW;
   }
 
-  s = clamp(s, 0.0, 1.0);
-  crease = clamp(crease, 0.0, 1.0);
-  glossy = clamp(glossy, 0.0, 1.0);
-
-  float lenAgg = length(aggDir);
-  vec2 dirN = lenAgg > 0.0001 ? aggDir / lenAgg : vec2(1.0, 0.0);
+  vec2 sampleUV = uv + warpOffset;
 
   vec2 videoUV = sampleUV * uCoverScale + uCoverOffset;
   videoUV.x = 1.0 - videoUV.x;
   videoUV = clamp(videoUV, 0.001, 0.999);
 
-  vec2 chroma = dirN * s * uRainbow * 0.02;
-  float r = texture(uTex, clamp(videoUV + chroma, 0.0, 1.0)).r;
-  float g = texture(uTex, videoUV).g;
-  float b = texture(uTex, clamp(videoUV - chroma, 0.0, 1.0)).b;
-  vec3 color = vec3(r, g, b);
+  vec2 dirN = vec2(1.0, 0.0);
+  if (chromaWeight > 0.0001) {
+    vec2 cd = chromaDirAcc / chromaWeight;
+    if (length(cd) > 0.0001) dirN = normalize(cd);
+  }
+  float chromaMag = clamp((dispMagTotal + foldGradTotal) * uRainbow * 0.22, 0.0, 0.5);
+  vec2 chromaOffUV = (dirN * chromaMag * uRadius) / vec2(aspect, 1.0);
+  vec2 chromaOffVideo = vec2(-chromaOffUV.x, chromaOffUV.y) * uCoverScale;
 
-  vec3 tint = 0.5 + 0.5 * cos(6.2831 * (s * 3.0 + vec3(0.0, 0.33, 0.67)));
-  color = mix(color, tint, s * uRainbow * 0.3);
+  vec3 colAcc = vec3(0.0);
+  vec3 wAcc = vec3(0.0);
+  vec2 uvk;
+  uvk = clamp(videoUV + chromaOffVideo * (-1.0), 0.001, 0.999); colAcc += texture(uTex, uvk).rgb * SPEC0; wAcc += SPEC0;
+  uvk = clamp(videoUV + chromaOffVideo * (-0.7142857), 0.001, 0.999); colAcc += texture(uTex, uvk).rgb * SPEC1; wAcc += SPEC1;
+  uvk = clamp(videoUV + chromaOffVideo * (-0.4285714), 0.001, 0.999); colAcc += texture(uTex, uvk).rgb * SPEC2; wAcc += SPEC2;
+  uvk = clamp(videoUV + chromaOffVideo * (-0.1428571), 0.001, 0.999); colAcc += texture(uTex, uvk).rgb * SPEC3; wAcc += SPEC3;
+  uvk = clamp(videoUV + chromaOffVideo * ( 0.1428571), 0.001, 0.999); colAcc += texture(uTex, uvk).rgb * SPEC4; wAcc += SPEC4;
+  uvk = clamp(videoUV + chromaOffVideo * ( 0.4285714), 0.001, 0.999); colAcc += texture(uTex, uvk).rgb * SPEC5; wAcc += SPEC5;
+  uvk = clamp(videoUV + chromaOffVideo * ( 0.7142857), 0.001, 0.999); colAcc += texture(uTex, uvk).rgb * SPEC6; wAcc += SPEC6;
+  uvk = clamp(videoUV + chromaOffVideo * ( 1.0), 0.001, 0.999); colAcc += texture(uTex, uvk).rgb * SPEC7; wAcc += SPEC7;
+  vec3 color = colAcc / max(wAcc, vec3(0.0001));
 
-  color += crease * 0.16;
-  color -= (1.0 - crease) * s * 0.06;
-  color += glossy * 0.22;
+  if (bandWeight > 0.0001) {
+    vec3 bandColor = bandAcc / bandWeight;
+    color = mix(color, bandColor, clamp(bandWeight, 0.0, 0.6));
+  }
+
+  vec3 spokeColor = vec3(1.0, 0.98, 0.95);
+  color += spokeColor * clamp(spokeAcc, 0.0, 1.0) * 1.3;
+  color += vec3(1.0) * clamp(glowAcc, 0.0, 1.0) * 0.5;
 
   fragColor = vec4(clamp(color, 0.0, 1.0), 1.0);
 }`;
@@ -545,8 +616,8 @@ function drawFallback(t) {
 // ---------- gui / params ----------
 const params = {
   strength: 1,
-  radius: 0.18,
-  creases: 14,
+  radius: 0.3,
+  creases: 22,
   rainbow: 1,
 };
 

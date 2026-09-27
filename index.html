@@ -427,6 +427,14 @@ uniform float uRainbow;
 uniform vec2 uCoverScale;
 uniform vec2 uCoverOffset;
 
+// ---------- plastic film pinch: procedural gravity-well warp ----------
+// No lighting model, no analytic height field: a soft, wide "suck-in"
+// toward each pinch point (with a converging singularity at the exact tip),
+// lobed into pleats, sheared into fold lines, textured with random thin
+// spokes, sampled through a few chromatic taps for fringing. Everything is
+// built from smooth exponentials/Gaussians so there is no hard mask and no
+// hard boundary; the falloff itself is what keeps the surroundings clean.
+
 float hash21(vec2 p) {
   p = fract(p * vec2(123.34, 456.21));
   p += dot(p, p + 45.32);
@@ -444,175 +452,158 @@ float vnoise(vec2 p) {
   return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 
-// thin radial spoke, hashed per angular cell for random presence/length/jitter.
-float spokeSet(vec2 rel, float d, float R, float seed, float nsp) {
-  float ang = atan(rel.y, rel.x);
-  float cell = (ang / 6.28318530718) * nsp;
-  float idx = floor(cell);
-  float f = fract(cell) - 0.5;
-  float jitter = (hash21(vec2(idx, seed + 1.0)) - 0.5) * 0.4;
-  float core = 1.0 - smoothstep(0.0, 0.028, abs(f - jitter));
-  float hLen = hash21(vec2(idx, seed + 5.0));
-  float onOff = step(0.5, hash21(vec2(idx, seed + 9.0)));
-  float len = R * mix(0.7, 3.2, hLen);
-  float along = smoothstep(len, len * 0.15, d) * exp(-d / (len * 0.55 + 0.001));
-  return core * onOff * along;
+float triWave(float x) {
+  return abs(fract(x) - 0.5) * 4.0 - 1.0;
 }
 
-const vec3 SPEC0 = vec3(1.0, 0.0, 0.15);
-const vec3 SPEC1 = vec3(1.0, 0.45, 0.0);
-const vec3 SPEC2 = vec3(1.0, 0.95, 0.0);
-const vec3 SPEC3 = vec3(0.15, 1.0, 0.15);
-const vec3 SPEC4 = vec3(0.0, 1.0, 0.7);
-const vec3 SPEC5 = vec3(0.0, 0.6, 1.0);
-const vec3 SPEC6 = vec3(0.25, 0.0, 1.0);
-const vec3 SPEC7 = vec3(0.7, 0.0, 1.0);
+// one antialiased angular spoke set: nsp thin radial lines per turn, each
+// present/absent and randomly lengthed per angular cell. The line itself is
+// built from a true perpendicular distance (d * angular-offset-in-radians);
+// dividing that by the known p-space size of one device pixel (1/uRes.y,
+// since p's vertical span 0..1 covers uRes.y pixels) gives an honest
+// screen-space pixel measure without fwidth(), which reliably triggers
+// WebGL context loss on the swiftshader/ANGLE software path used here when
+// called from inside this uniform-but-dynamic-trip-count loop.
+float spokeSet(vec2 rel, float d, float R, float seed, float nsp) {
+  const float TAU = 6.28318530718;
+  float ang = atan(rel.y, rel.x);
+  float cell = (ang / TAU) * nsp;
+  float idx = floor(cell);
+  float cellFrac = fract(cell) - 0.5;
+  float jitter = (hash21(vec2(idx, seed + 1.0)) - 0.5) * 0.4;
+  float angOff = (cellFrac - jitter) * (TAU / nsp);
+  float distFromLine = d * angOff;
+  float px = 1.0 / max(uRes.y, 1.0);
+  float core = 1.0 - smoothstep(0.0, 1.5 * px, abs(distFromLine));
+  float hLen = hash21(vec2(idx, seed + 5.0));
+  float onOff = step(0.5, hash21(vec2(idx, seed + 9.0)));
+  float len = R * mix(0.6, 2.6, hLen);
+  float lengthMask = smoothstep(len, len * 0.15, d) * exp(-d / (len * 0.55 + 0.001));
+  return core * onOff * lengthMask;
+}
+
+vec2 toVideoUV(vec2 samplePt) {
+  float aspect = uRes.x / uRes.y;
+  vec2 sUV = samplePt / vec2(aspect, 1.0);
+  vec2 vv = sUV * uCoverScale + uCoverOffset;
+  vv.x = 1.0 - vv.x;
+  return clamp(vv, 0.001, 0.999);
+}
+
+const vec3 SPEC0 = vec3(1.0, 0.0, 0.0);
+const vec3 SPEC1 = vec3(1.0, 0.5, 0.0);
+const vec3 SPEC2 = vec3(1.0, 1.0, 0.0);
+const vec3 SPEC3 = vec3(0.0, 1.0, 0.3);
+const vec3 SPEC4 = vec3(0.0, 0.6, 1.0);
+const vec3 SPEC5 = vec3(0.3, 0.0, 1.0);
+const vec3 SPEC6 = vec3(0.6, 0.0, 1.0);
 
 void main() {
   vec2 uv = vUV;
   float aspect = uRes.x / uRes.y;
   vec2 p = uv * vec2(aspect, 1.0);
+  const float TAU = 6.28318530718;
 
-  vec2 warpOffset = vec2(0.0);
-  float dispMagTotal = 0.0;
-  float foldGradTotal = 0.0;
-  vec2 chromaDirAcc = vec2(0.0);
-  float chromaWeight = 0.0;
-  float chromaSAcc = 0.0;
+  vec2 totalDisp = vec2(0.0);
   float spokeAcc = 0.0;
   float glowAcc = 0.0;
-  vec3 bandAcc = vec3(0.0);
-  float bandWeight = 0.0;
+  float sheenAcc = 0.0;
+
+  // dominant (strongest-influence) pull at this pixel, used for the
+  // chroma-spread formula below.
+  float bestW = -1.0;
+  float domU = 0.0;
+  float domP = 0.0;
+  float domS = 0.0;
+  vec2 domRd = vec2(1.0, 0.0);
 
   for (int i = 0; i < 4; i++) {
     if (i >= uCount) break;
-    vec2 anchor = uAnchor[i];
-    vec2 pull = uPull[i];
-    // uStrain now spans a much wider range and means "how far the film is
-    // pulled toward the viewer": ~0.15 is a bare pinch, ~0.6-0.8 is a full
-    // grab (the original strength-1.0 look), and ~1.2-2.0 is an extreme
-    // pull that tents the whole burst up toward the camera.
     float s = uStrain[i];
     if (s < 0.0002) continue;
 
-    vec2 centerUV = anchor + pull;
-    vec2 centerP = centerUV * vec2(aspect, 1.0);
-    vec2 relP = p - centerP;
-    float dP = length(relP);
-    vec2 dirP = relP / max(dP, 0.0001);
+    vec2 c = (uAnchor[i] + uPull[i]) * vec2(aspect, 1.0);
+    vec2 rel = p - c;
+    float d = length(rel);
+    vec2 rd = rel / max(d, 1e-4);
+    float ang = atan(rel.y, rel.x);
+    float ss = smoothstep(0.0, 1.8, s);
+    float R = uRadius * (0.6 + 0.7 * ss);
+    float u = d / max(R, 1e-4);
 
-    // region radius grows with strain: a bare pinch stays tight (~0.4 * uRadius),
-    // a full grab (s ~ 0.7) sits at ~uRadius, and an extreme pull tents the
-    // region out to ~2x uRadius.
-    float Rfactor = 0.4 + 1.6 * smoothstep(0.0, 1.8, s);
-    float R = max(uRadius, 0.01) * Rfactor;
-    float t = dP / R;
-    // hard region mask: 1 inside the burst, exactly 0 by 1.4R. Everything geometric/
-    // colored below is gated by this so the surrounding frame stays pixel-clean.
-    float m = 1.0 - smoothstep(0.9 * R, 1.4 * R, dP);
+    // wide soft gravity well; g(0) = 0.5 (not 0) so the exact tip samples
+    // from a ring around it rather than its own point, which is what makes
+    // the streaks converge to (not vanish at) the pinch.
+    float g = exp(-1.4 * u * u) * (0.5 + u);
+    float k = min(s * 0.9, 1.2);
+    float pullIn = k * R * g;
 
-    // radial suck-in profile: 0 at center, peaks near t=0.5, tapers off by ~1.2R.
-    float radialMag = 5.437 * t * exp(-2.0 * t);
+    // lobed pleats: two harmonics of the crease count, phase kinked by slow
+    // angular value-noise (plus a gentle time drift) so lobes aren't a
+    // perfect mandala.
+    float N = max(uCreases, 1.0);
+    float ph = 2.5 * vnoise(vec2(ang * 1.5, u * 0.8) + float(i) * 7.0) + 0.15 * uTime;
+    float P = sin(N * ang + ph) + 0.5 * sin(2.0 * N * ang + 1.7 * ph);
+    pullIn *= (1.0 + 0.35 * P);
 
-    // pleated angular folds, phase perturbed by low-freq noise (and slow drift).
-    // a fine secondary harmonic fades in at high strain for longer, thinner petals.
-    float ang = atan(relP.y, relP.x);
-    float noisePhase = vnoise(vec2(ang * 1.5 + uTime * 0.05, t * 3.0) * 2.0 + float(i) * 13.7) * 2.0 - 1.0;
-    float fineFold = 0.35 * smoothstep(0.7, 2.0, s) * sin(uCreases * 2.0 * ang - noisePhase * 1.7);
-    float fold = sin(uCreases * ang + noisePhase * 1.2) + fineFold;
-    float foldMod = 1.0 + 0.8 * fold;
+    // fold shear: a triangle wave tangential nudge, only near the tip
+    // (exp(-u*u)), that reads as the thin crease lines between lobes.
+    vec2 tang = vec2(-rd.y, rd.x);
+    float shear = 0.05 * R * min(s, 1.5) * exp(-u * u) * triWave(N * ang / TAU + ph * 0.1);
 
-    float mag = radialMag * foldMod;
-    // strainScale is the master intensity dial, calibrated so a full grab
-    // (s = 0.7) reproduces the original strength-1.0 look, stays gentle for a
-    // bare pinch (s ~ 0.15) and keeps climbing for an extreme tented pull.
-    float strainScale = clamp(1.4286 * s, 0.0, 3.2);
-    // cap the radial pull-in at ~0.6R so content near the edge of the burst barely moves.
-    float amt = min(mag * strainScale * uStrength * 0.26, 0.6) * m;
+    vec2 disp = rd * pullIn + tang * shear;
+    // directional drag: grabbed content follows the hand.
+    disp -= uPull[i] * vec2(aspect, 1.0) * uStrength * 0.6 * exp(-u * u);
+    disp *= uStrength;
 
-    vec2 offP = dirP * amt * R;
-    vec2 offUV = offP / vec2(aspect, 1.0);
+    totalDisp += disp;
 
-    // tangential swirl dominates over radial so the folds read as distinct petals.
-    vec2 tangentP = vec2(-dirP.y, dirP.x);
-    float wob = cos(uCreases * 0.5 * ang + noisePhase * 2.0);
-    vec2 wobOffUV = (tangentP * wob * amt * R * 0.42) / vec2(aspect, 1.0);
-
-    // directional term: grabbed content follows the hand, elongating the pattern
-    // and reading as the film tenting up toward the viewer at high strain.
-    float gauss = exp(-(dP * dP) / max(R * R, 0.0001));
-    vec2 pullOffUV = -pull * uStrength * gauss * strainScale * m;
-
-    warpOffset += offUV + wobOffUV + pullOffUV;
-
-    dispMagTotal += amt;
-    foldGradTotal += abs(fold) * m * 0.3 * strainScale;
-    chromaDirAcc += dirP * amt;
-    chromaWeight += amt;
-    chromaSAcc += s * amt;
-
-    // spoke count/length grow with strain: an extreme pull sprouts many long
-    // spokes reaching toward the frame edges (length also scales via R above),
-    // while a bare pinch shows only a faint handful.
+    // random thin radial spokes, two angular densities layered together.
     float seed = float(i) * 41.17;
-    float spokeGrow = smoothstep(0.7, 2.0, s);
-    float sp = spokeSet(relP, dP, R, seed, 140.0 + 70.0 * spokeGrow)
-             + 0.6 * spokeSet(relP, dP, R * 0.7, seed + 71.0, 97.0 + 50.0 * spokeGrow);
-    spokeAcc += sp * strainScale;
+    float sp = spokeSet(rel, d, R, seed, 72.0) + 0.6 * spokeSet(rel, d, R * 0.75, seed + 71.0, 48.0);
+    spokeAcc += sp * 0.55 * min(s, 1.5);
 
-    // small soft glow dot right at the pinch center; grows only slightly with strain.
-    float glowSigma = max(uRadius, 0.01) * 0.06 * mix(1.0, 1.35, smoothstep(0.7, 2.0, s));
-    glowAcc += exp(-dP * dP / (2.0 * pow(glowSigma, 2.0))) * clamp(strainScale, 0.0, 1.6) * m;
+    // small center glow right at the tip.
+    float gsig = max(0.04 * R, 1e-4);
+    glowAcc += exp(-(d * d) / (2.0 * gsig * gsig)) * 0.2 * min(s, 1.2);
 
-    // thin-film style saturated hue ring, phase-locked to the folds.
-    float bandT = fract(t * 3.0 + noisePhase);
-    vec3 band = 0.5 + 0.5 * cos(6.28318 * (bandT + vec3(0.0, 0.333, 0.667)));
-    float bandW = 0.25 * m * clamp(strainScale, 0.0, 1.3);
-    bandAcc += band * bandW;
-    bandWeight += bandW;
+    // slight sheen on the lit side of each pleat.
+    sheenAcc += 0.05 * min(s, 1.2) * exp(-u * u) * max(P, 0.0);
+
+    float w = s * g;
+    if (w > bestW) { bestW = w; domU = u; domP = P; domRd = rd; domS = s; }
   }
 
-  vec2 sampleUV = uv + warpOffset;
+  vec2 sampleP = p + totalDisp;
 
-  vec2 videoUV = sampleUV * uCoverScale + uCoverOffset;
-  videoUV.x = 1.0 - videoUV.x;
-  videoUV = clamp(videoUV, 0.001, 0.999);
+  vec2 dirD = domRd;
+  float dl = length(totalDisp);
+  if (dl > 1e-5) dirD = totalDisp / dl;
 
-  vec2 dirN = vec2(1.0, 0.0);
-  float sAvg = 0.0;
-  if (chromaWeight > 0.0001) {
-    vec2 cd = chromaDirAcc / chromaWeight;
-    if (length(cd) > 0.0001) dirN = normalize(cd);
-    sAvg = chromaSAcc / chromaWeight;
-  }
-  // fringing widens and saturates further on top of the base look as the pull
-  // goes extreme (s well past the s=0.7 "full grab" calibration point).
-  float chromaWiden = mix(1.0, 2.0, smoothstep(0.6, 2.0, sAvg));
-  float chromaMag = clamp((dispMagTotal + foldGradTotal) * uRainbow * 0.22 * chromaWiden, 0.0, 0.9);
-  vec2 chromaOffUV = (dirN * chromaMag * uRadius) / vec2(aspect, 1.0);
-  vec2 chromaOffVideo = vec2(-chromaOffUV.x, chromaOffUV.y) * uCoverScale;
+  // ---------- chromatic fringes: 7 taps along the local displacement ----------
+  // spread is driven by the dominant pull's u/P so fringing shows up right
+  // at the lobe/fold edges (where |P| and the near-tip falloff are both
+  // high) instead of as flat concentric rings.
+  float spread = uRainbow * min(domS, 1.5) * 0.035 * exp(-1.2 * domU * domU) * (0.35 + 0.65 * abs(domP));
 
   vec3 colAcc = vec3(0.0);
   vec3 wAcc = vec3(0.0);
   vec2 uvk;
-  uvk = clamp(videoUV + chromaOffVideo * (-1.0), 0.001, 0.999); colAcc += texture(uTex, uvk).rgb * SPEC0; wAcc += SPEC0;
-  uvk = clamp(videoUV + chromaOffVideo * (-0.7142857), 0.001, 0.999); colAcc += texture(uTex, uvk).rgb * SPEC1; wAcc += SPEC1;
-  uvk = clamp(videoUV + chromaOffVideo * (-0.4285714), 0.001, 0.999); colAcc += texture(uTex, uvk).rgb * SPEC2; wAcc += SPEC2;
-  uvk = clamp(videoUV + chromaOffVideo * (-0.1428571), 0.001, 0.999); colAcc += texture(uTex, uvk).rgb * SPEC3; wAcc += SPEC3;
-  uvk = clamp(videoUV + chromaOffVideo * ( 0.1428571), 0.001, 0.999); colAcc += texture(uTex, uvk).rgb * SPEC4; wAcc += SPEC4;
-  uvk = clamp(videoUV + chromaOffVideo * ( 0.4285714), 0.001, 0.999); colAcc += texture(uTex, uvk).rgb * SPEC5; wAcc += SPEC5;
-  uvk = clamp(videoUV + chromaOffVideo * ( 0.7142857), 0.001, 0.999); colAcc += texture(uTex, uvk).rgb * SPEC6; wAcc += SPEC6;
-  uvk = clamp(videoUV + chromaOffVideo * ( 1.0), 0.001, 0.999); colAcc += texture(uTex, uvk).rgb * SPEC7; wAcc += SPEC7;
+  float f;
+
+  f = -1.0;      uvk = toVideoUV(sampleP + dirD * spread * f); colAcc += texture(uTex, uvk).rgb * SPEC0; wAcc += SPEC0;
+  f = -0.66667;  uvk = toVideoUV(sampleP + dirD * spread * f); colAcc += texture(uTex, uvk).rgb * SPEC1; wAcc += SPEC1;
+  f = -0.33333;  uvk = toVideoUV(sampleP + dirD * spread * f); colAcc += texture(uTex, uvk).rgb * SPEC2; wAcc += SPEC2;
+  f =  0.0;      uvk = toVideoUV(sampleP + dirD * spread * f); colAcc += texture(uTex, uvk).rgb * SPEC3; wAcc += SPEC3;
+  f =  0.33333;  uvk = toVideoUV(sampleP + dirD * spread * f); colAcc += texture(uTex, uvk).rgb * SPEC4; wAcc += SPEC4;
+  f =  0.66667;  uvk = toVideoUV(sampleP + dirD * spread * f); colAcc += texture(uTex, uvk).rgb * SPEC5; wAcc += SPEC5;
+  f =  1.0;      uvk = toVideoUV(sampleP + dirD * spread * f); colAcc += texture(uTex, uvk).rgb * SPEC6; wAcc += SPEC6;
+
   vec3 color = colAcc / max(wAcc, vec3(0.0001));
 
-  if (bandWeight > 0.0001) {
-    vec3 bandColor = bandAcc / bandWeight;
-    color = mix(color, bandColor, clamp(bandWeight, 0.0, 0.6));
-  }
-
-  vec3 spokeColor = vec3(1.0, 0.98, 0.95);
-  color += spokeColor * clamp(spokeAcc, 0.0, 1.0) * 1.3;
-  color += vec3(1.0) * clamp(glowAcc, 0.0, 1.0) * 0.5;
+  color += vec3(1.0) * spokeAcc;
+  color += vec3(1.0) * glowAcc;
+  color += vec3(1.0) * sheenAcc;
 
   fragColor = vec4(clamp(color, 0.0, 1.0), 1.0);
 }`;
@@ -695,8 +686,8 @@ function drawFallback(t) {
 // ---------- gui / params ----------
 const params = {
   strength: 1,
-  radius: 0.3,
-  creases: 22,
+  radius: 0.28,
+  creases: 16,
   rainbow: 1,
 };
 
